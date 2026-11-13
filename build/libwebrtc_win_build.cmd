@@ -66,6 +66,18 @@ if not "!commit!" == "" (
 )
 echo "Checkout ref: !checkout_ref!"
 
+rem Resenha: with LIBWEBRTC_FAST_SYNC=1 the checkout skips the git history (a
+rem shallow clone of the branch and gclient --no-history), which cuts most of
+rem the ~20 minute download on a fresh CI machine. Needs a branch name, not a
+rem commit hash.
+if "!LIBWEBRTC_FAST_SYNC!" == "1" if "!commit!" == "" (
+  if not exist src (
+    call git clone --depth 1 --branch "!checkout_ref!" https://github.com/webrtc-sdk/webrtc.git src
+  )
+  call gclient.bat sync --no-history --shallow --jobs=16
+  goto synced
+)
+
 if not exist src (
   call git clone https://github.com/webrtc-sdk/webrtc.git src
 )
@@ -77,6 +89,7 @@ call git clean -df
 popd
 
 call gclient.bat sync --with_branch_heads --jobs=8
+:synced
 
 
 if not exist src/libwebrtc (
@@ -110,12 +123,24 @@ if "!profile!" == "debug" (
   set "debug=true"
 )
 
+rem Resenha: LIBWEBRTC_CC_WRAPPER (e.g. sccache) caches compiled objects across
+rem CI runs, so a small change recompiles only what it touches.
+set "wrapper_arg="
+if not "!LIBWEBRTC_CC_WRAPPER!" == "" (
+  set "wrapper_arg= cc_wrapper=\"!LIBWEBRTC_CC_WRAPPER!\""
+)
+rem Resenha: LIBWEBRTC_SKIP_TESTS=1 builds only the DLL.
+set "ninja_targets=libwebrtc libwebrtc_cpp_api_unittests"
+if "!LIBWEBRTC_SKIP_TESTS!" == "1" (
+  set "ninja_targets=libwebrtc"
+)
+
 rem generate ninja for release
 call gn.bat gen %OUTPUT_DIR% --root="src" ^
-  --args="is_debug=!debug! is_clang=true target_cpu=\"!arch!\" use_custom_libcxx=false rtc_libvpx_build_vp9=true enable_libaom=true rtc_include_tests=true rtc_build_examples=false rtc_build_tools=false is_component_build=false rtc_enable_protobuf=false rtc_use_h264=true ffmpeg_branding=\"Chrome\" rtc_use_h265=true symbol_level=0 enable_iterator_debugging=false"
+  --args="is_debug=!debug! is_clang=true target_cpu=\"!arch!\" use_custom_libcxx=false rtc_libvpx_build_vp9=true enable_libaom=true rtc_include_tests=true rtc_build_examples=false rtc_build_tools=false is_component_build=false rtc_enable_protobuf=false rtc_use_h264=true ffmpeg_branding=\"Chrome\" rtc_use_h265=true symbol_level=0 enable_iterator_debugging=false!wrapper_arg!"
 
 rem build
-ninja.exe -C %OUTPUT_DIR% libwebrtc libwebrtc_cpp_api_unittests
+ninja.exe -C %OUTPUT_DIR% !ninja_targets!
 
 if errorlevel 1 exit /b 1
 

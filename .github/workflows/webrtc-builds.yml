@@ -113,7 +113,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        # Resenha: only x64 (the app ships no Windows arm64 build).
+        arch: [x64]
         profile:
           - ${{ github.event.inputs.configuration || 'release' }}
     name: Build libwebrtc.dll for Windows (${{ matrix.arch }}-${{ matrix.profile }})
@@ -137,9 +138,22 @@ jobs:
         shell: bash
         working-directory: build
 
+      # Resenha: sccache keeps compiled objects in the GitHub Actions cache.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+
       - name: Build WebRTC
         run: .\libwebrtc_win_build.cmd --arch ${{ matrix.arch }} --profile ${{ matrix.profile }} --commit "${{ github.event.inputs.commitHash }}"
         working-directory: build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          LIBWEBRTC_CC_WRAPPER: sccache
+          LIBWEBRTC_FAST_SYNC: "1"
+          LIBWEBRTC_SKIP_TESTS: "1"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
       - name: Zip artifact (Windows)
         run: Compress-Archive -Path .\build\libwebrtc-${{ matrix.arch }}-${{ matrix.profile }} -DestinationPath .\build\libwebrtc-win-${{ matrix.arch }}-${{ matrix.profile }}.zip
