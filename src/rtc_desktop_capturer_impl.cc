@@ -34,6 +34,7 @@
 
 #include <cwchar>
 
+#include "modules/desktop_capture/win/screen_capture_utils.h"
 #include "modules/desktop_capture/win/wgc_capturer_win.h"
 #include "rtc_base/win/get_activation_factory.h"
 #include "rtc_base/win/hstring.h"
@@ -53,6 +54,69 @@ RTCDesktopCapturerOptions OptionsWithCursor(bool show_cursor) {
 }
 
 #if defined(WEBRTC_WIN) && defined(RTC_ENABLE_WIN_WGC)
+// Makes the frames of a Windows.Graphics.Capture window capturer use the
+// coordinates DesktopAndCursorComposer expects.
+//
+// The composer reads the cursor from a full desktop MouseCursorMonitor, which
+// reports positions relative to the top left of the virtual screen. The GDI
+// window capturer stamps its frames in those same coordinates, but
+// WgcCapturerWin stamps them with the raw GetWindowRect() position, which is
+// relative to the primary monitor. The two only agree while no monitor sits
+// to the left of or above the primary one. With such a monitor the composer
+// looks for the cursor in the wrong place: it is not drawn while it is over
+// the shared window, and shows up while it is over another monitor.
+class VirtualScreenRelativeCapturer : public webrtc::DesktopCapturer,
+                                      public webrtc::DesktopCapturer::Callback {
+ public:
+  explicit VirtualScreenRelativeCapturer(
+      std::unique_ptr<webrtc::DesktopCapturer> capturer)
+      : capturer_(std::move(capturer)) {}
+
+  // webrtc::DesktopCapturer
+  void Start(webrtc::DesktopCapturer::Callback* callback) override {
+    callback_ = callback;
+    capturer_->Start(this);
+  }
+  void SetMaxFrameRate(uint32_t max_frame_rate) override {
+    capturer_->SetMaxFrameRate(max_frame_rate);
+  }
+  void SetSharedMemoryFactory(std::unique_ptr<webrtc::SharedMemoryFactory>
+                                  shared_memory_factory) override {
+    capturer_->SetSharedMemoryFactory(std::move(shared_memory_factory));
+  }
+  void CaptureFrame() override { capturer_->CaptureFrame(); }
+  void SetExcludedWindow(webrtc::WindowId window) override {
+    capturer_->SetExcludedWindow(window);
+  }
+  bool GetSourceList(SourceList* sources) override {
+    return capturer_->GetSourceList(sources);
+  }
+  bool SelectSource(SourceId id) override {
+    return capturer_->SelectSource(id);
+  }
+  bool FocusOnSelectedSource() override {
+    return capturer_->FocusOnSelectedSource();
+  }
+  bool IsOccluded(const webrtc::DesktopVector& pos) override {
+    return capturer_->IsOccluded(pos);
+  }
+
+  // webrtc::DesktopCapturer::Callback
+  void OnFrameCaptureStart() override { callback_->OnFrameCaptureStart(); }
+  void OnCaptureResult(webrtc::DesktopCapturer::Result result,
+                       std::unique_ptr<webrtc::DesktopFrame> frame) override {
+    if (frame) {
+      frame->set_top_left(frame->top_left().subtract(
+          webrtc::GetFullscreenRect().top_left()));
+    }
+    callback_->OnCaptureResult(result, std::move(frame));
+  }
+
+ private:
+  std::unique_ptr<webrtc::DesktopCapturer> capturer_;
+  webrtc::DesktopCapturer::Callback* callback_ = nullptr;
+};
+
 // Whether Windows lets this app capture without the WGC capture border: the
 // system has GraphicsCaptureSession.IsBorderRequired (Windows 11) and
 // GraphicsCaptureAccess grants borderless capture. Runs on a COM initialized
@@ -212,8 +276,16 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
                 webrtc::DesktopCapturer::CreateScreenCapturer(options_));
       }
     } else {
+      std::unique_ptr<webrtc::DesktopCapturer> window_capturer =
+          webrtc::DesktopCapturer::CreateWindowCapturer(options_);
+#if defined(WEBRTC_WIN) && defined(RTC_ENABLE_WIN_WGC)
+      if (use_wgc_ && window_capturer) {
+        window_capturer = std::make_unique<VirtualScreenRelativeCapturer>(
+            std::move(window_capturer));
+      }
+#endif
       capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-          webrtc::DesktopCapturer::CreateWindowCapturer(options_), options_);
+          std::move(window_capturer), options_);
     }
   });
 }
