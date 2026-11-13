@@ -26,6 +26,7 @@
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
 #if defined(RTC_ENABLE_WIN_WGC)
+#include <dwmapi.h>
 #include <windows.foundation.metadata.h>
 #include <windows.graphics.capture.h>
 #include <windows.security.authorization.appcapabilityaccess.h>
@@ -65,6 +66,12 @@ RTCDesktopCapturerOptions OptionsWithCursor(bool show_cursor) {
 // to the left of or above the primary one. With such a monitor the composer
 // looks for the cursor in the wrong place: it is not drawn while it is over
 // the shared window, and shows up while it is over another monitor.
+//
+// WGC also crops the invisible resize border Windows 10 and 11 keep around a
+// window (about 7 pixels on the left, right and bottom), while the raw
+// position still includes it, so the cursor was drawn that far to the right.
+// The frame position is taken from the visible bounds of the window
+// (DWMWA_EXTENDED_FRAME_BOUNDS), the same rectangle WGC captures.
 class VirtualScreenRelativeCapturer : public webrtc::DesktopCapturer,
                                       public webrtc::DesktopCapturer::Callback {
  public:
@@ -92,6 +99,7 @@ class VirtualScreenRelativeCapturer : public webrtc::DesktopCapturer,
     return capturer_->GetSourceList(sources);
   }
   bool SelectSource(SourceId id) override {
+    window_ = reinterpret_cast<HWND>(id);
     return capturer_->SelectSource(id);
   }
   bool FocusOnSelectedSource() override {
@@ -106,8 +114,16 @@ class VirtualScreenRelativeCapturer : public webrtc::DesktopCapturer,
   void OnCaptureResult(webrtc::DesktopCapturer::Result result,
                        std::unique_ptr<webrtc::DesktopFrame> frame) override {
     if (frame) {
-      frame->set_top_left(frame->top_left().subtract(
-          webrtc::GetFullscreenRect().top_left()));
+      webrtc::DesktopVector top_left = frame->top_left();
+      RECT bounds;
+      if (window_ &&
+          SUCCEEDED(::DwmGetWindowAttribute(window_,
+                                            DWMWA_EXTENDED_FRAME_BOUNDS,
+                                            &bounds, sizeof(bounds)))) {
+        top_left = webrtc::DesktopVector(bounds.left, bounds.top);
+      }
+      frame->set_top_left(
+          top_left.subtract(webrtc::GetFullscreenRect().top_left()));
     }
     callback_->OnCaptureResult(result, std::move(frame));
   }
@@ -115,6 +131,7 @@ class VirtualScreenRelativeCapturer : public webrtc::DesktopCapturer,
  private:
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
   webrtc::DesktopCapturer::Callback* callback_ = nullptr;
+  HWND window_ = nullptr;
 };
 
 // Whether Windows lets this app capture without the WGC capture border: the
