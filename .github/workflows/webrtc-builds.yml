@@ -1,12 +1,8 @@
 name: libwebrtc binary build/release.
 on:
+  # Resenha: builds only by hand (workflow_dispatch) or on tags; each one takes
+  # a Windows runner for a long time.
   push:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - 'NOTICE'
-      - '.gitignore'
-      - '.dockerignore'
     tags:
       - "*"
   workflow_dispatch:
