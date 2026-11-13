@@ -75,6 +75,12 @@ if "!LIBWEBRTC_FAST_SYNC!" == "1" if "!commit!" == "" (
     call git clone --depth 1 --branch "!checkout_ref!" https://github.com/webrtc-sdk/webrtc.git src
   )
   call gclient.bat sync --no-history --shallow --jobs=16
+  rem Without history build/util/lastchange.py writes commit time 0, and the
+  rem link timestamp computed from it is negative ("lld-link: invalid
+  rem timestamp"). Use the time of the checked out WebRTC commit instead.
+  for /f %%t in ('git -C src log -1 --format^=%%ct') do set "committime=%%t"
+  echo !committime!> src\build\util\LASTCHANGE.committime
+  echo "LASTCHANGE.committime: !committime!"
   goto synced
 )
 
