@@ -68,13 +68,24 @@ echo "Checkout ref: !checkout_ref!"
 
 rem Resenha: with LIBWEBRTC_FAST_SYNC=1 the checkout skips the git history (a
 rem shallow clone of the branch and gclient --no-history), which cuts most of
-rem the ~20 minute download on a fresh CI machine. Needs a branch name, not a
-rem commit hash.
-if "!LIBWEBRTC_FAST_SYNC!" == "1" if "!commit!" == "" (
+rem the ~20 minute download on a fresh CI machine. With a commit hash only
+rem that commit is fetched, so a build can be pinned while the branch moves on.
+if "!LIBWEBRTC_FAST_SYNC!" == "1" (
   if not exist src (
-    call git clone --depth 1 --branch "!checkout_ref!" https://github.com/webrtc-sdk/webrtc.git src
+    if "!commit!" == "" (
+      call git clone --depth 1 --branch "!checkout_ref!" https://github.com/webrtc-sdk/webrtc.git src
+    ) else (
+      call git init src
+      call git -C src remote add origin https://github.com/webrtc-sdk/webrtc.git
+      call git -C src fetch --depth 1 origin "!commit!"
+      call git -C src checkout -f FETCH_HEAD
+    )
   )
-  call gclient.bat sync --no-history --shallow --jobs=16
+  if "!commit!" == "" (
+    call gclient.bat sync --no-history --shallow --jobs=16
+  ) else (
+    call gclient.bat sync --no-history --shallow --jobs=16 --revision "src@!commit!"
+  )
   rem Without history build/util/lastchange.py writes commit time 0, and the
   rem link timestamp computed from it is negative ("lld-link: invalid
   rem timestamp"). Use the time of the checked out WebRTC commit instead.
