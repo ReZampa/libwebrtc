@@ -222,11 +222,11 @@ rtc_shared_library("libwebrtc") {
     ]
   }
 
-  # WMF H.265 support (Windows without Intel Media SDK)
+  # WMF H.265 support and H.264 on the GPU (Windows without Intel Media SDK)
   if (is_win && !libwebrtc_intel_media_sdk && rtc_use_h265) {
     sources += [
-      "src/win/wmf_h265_encoder.cc",
-      "src/win/wmf_h265_encoder.h",
+      "src/win/wmf_video_encoder.cc",
+      "src/win/wmf_video_encoder.h",
       "src/win/wmf_h265_decoder.cc",
       "src/win/wmf_h265_decoder.h",
       "src/win/wmf_h265_factory.cc",
@@ -286,6 +286,11 @@ rtc_shared_library("libwebrtc") {
     "//third_party/boringssl:boringssl",
     "//third_party/libyuv",
   ]
+
+  # The H.264 GPU encoder falls back to OpenH264 (src/win/wmf_h265_factory.cc).
+  if (is_win && !libwebrtc_intel_media_sdk && rtc_use_h265) {
+    deps += [ "../api/video_codecs:rtc_software_fallback_wrappers" ]
+  }
 
   # screen capture device
   if (libwebrtc_desktop_capture) {

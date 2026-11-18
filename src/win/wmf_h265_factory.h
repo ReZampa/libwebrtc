@@ -17,8 +17,9 @@
 
 namespace webrtc {
 
-// Creates a video encoder factory that adds H.265 hardware encoding
-// (via Windows Media Foundation) on top of the builtin encoder factory.
+// Creates a video encoder factory that adds H.265 encoding and H.264 hardware
+// encoding (via Windows Media Foundation) on top of the builtin encoder
+// factory. H.264 falls back to the builtin encoder without a GPU encoder.
 std::unique_ptr<VideoEncoderFactory>
 CreateWmfH265EncoderFactory(std::unique_ptr<VideoEncoderFactory> builtin);
 

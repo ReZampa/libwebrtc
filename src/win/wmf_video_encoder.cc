@@ -1,7 +1,7 @@
 // Copyright 2024 libwebrtc project authors. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "src/win/wmf_h265_encoder.h"
+#include "src/win/wmf_video_encoder.h"
 
 #include <codecapi.h>
 #include <mftransform.h>
@@ -10,14 +10,18 @@
 #include <algorithm>
 #include <cstdio>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 
 #include "api/video/encoded_image.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_codec_type.h"
+#include "api/video_codecs/h264_profile_level_id.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "media/base/media_constants.h"
+#include "modules/video_coding/codecs/h264/include/h264_globals.h"
+#include "modules/video_coding/codecs/interface/common_constants.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/checks.h"
@@ -45,50 +49,130 @@ constexpr int kMaxEventsPerEncode = 256;
 // Upper bound on frames in flight inside the MFT that we keep timing for.
 constexpr size_t kMaxPendingFrameTimings = 64;
 
+GUID SubtypeOf(VideoCodecType codec_type) {
+  return codec_type == kVideoCodecH264 ? MFVideoFormat_H264
+                                       : MFVideoFormat_HEVC;
+}
+
+// H.265 keeps the flags it shipped with (software MFTs included). H.264 asks
+// for hardware MFTs only.
+UINT32 EnumFlagsOf(VideoCodecType codec_type) {
+  if (codec_type == kVideoCodecH264) {
+    return MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+  }
+  return MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
+         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+}
+
+// One Annex B NAL unit: where its start code begins, where its header byte
+// is, and where it ends (the next start code or the end of the buffer).
+struct Nalu {
+  size_t start = 0;
+  size_t header = 0;
+  size_t end = 0;
+};
+
+std::vector<Nalu> SplitNalus(const uint8_t* data, size_t size) {
+  std::vector<Nalu> nalus;
+  size_t i = 0;
+  while (i + 3 <= size) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      // A 4-byte start code is a zero byte followed by the 3-byte one.
+      size_t start = (i > 0 && data[i - 1] == 0) ? i - 1 : i;
+      if (!nalus.empty()) nalus.back().end = start;
+      nalus.push_back({start, i + 3, size});
+      i += 3;
+    } else {
+      ++i;
+    }
+  }
+  // Drop units without a header byte (a stray start code at the very end).
+  nalus.erase(std::remove_if(nalus.begin(), nalus.end(),
+                             [](const Nalu& n) { return n.header >= n.end; }),
+              nalus.end());
+  return nalus;
+}
+
+uint8_t NaluType(VideoCodecType codec_type, uint8_t header) {
+  return codec_type == kVideoCodecH264 ? (header & 0x1F)
+                                       : ((header >> 1) & 0x3F);
+}
+
+bool IsParameterSet(VideoCodecType codec_type, uint8_t type) {
+  // H.264: SPS(7), PPS(8). H.265: VPS(32), SPS(33), PPS(34).
+  return codec_type == kVideoCodecH264 ? (type == 7 || type == 8)
+                                       : (type >= 32 && type <= 34);
+}
+
+bool IsKeyframeSlice(VideoCodecType codec_type, uint8_t type) {
+  // H.264: IDR slice(5). H.265: IRAP VCL units, BLA_W_LP(16) through
+  // RSV_IRAP_VCL23(23).
+  return codec_type == kVideoCodecH264 ? type == 5
+                                       : (type >= 16 && type <= 23);
+}
+
+// The H.264 profile the session negotiated, as a Media Foundation profile.
+// Constrained Baseline first: it is what Baseline means to WebRTC peers.
+std::vector<UINT32> H264ProfilesFor(const SdpVideoFormat& format) {
+  std::optional<H264ProfileLevelId> id =
+      ParseSdpForH264ProfileLevelId(format.parameters);
+  H264Profile profile =
+      id ? id->profile : H264Profile::kProfileConstrainedBaseline;
+  switch (profile) {
+    case H264Profile::kProfileMain:
+      return {eAVEncH264VProfile_Main};
+    case H264Profile::kProfileConstrainedHigh:
+    case H264Profile::kProfileHigh:
+      return {eAVEncH264VProfile_High};
+    default:
+      return {eAVEncH264VProfile_ConstrainedBase, eAVEncH264VProfile_Base};
+  }
+}
+
 }  // namespace
 
-WmfH265Encoder::WmfH265Encoder(const VideoCodec& codec)
-    : codec_settings_(codec) {}
+WmfVideoEncoder::WmfVideoEncoder(VideoCodecType codec_type,
+                                 const SdpVideoFormat& format)
+    : codec_type_(codec_type), format_(format) {
+  RTC_DCHECK(codec_type == kVideoCodecH264 || codec_type == kVideoCodecH265);
+}
 
-WmfH265Encoder::~WmfH265Encoder() {
+WmfVideoEncoder::~WmfVideoEncoder() {
   Release();
 }
 
-std::unique_ptr<WmfH265Encoder> WmfH265Encoder::Create(
-    const VideoCodec& codec) {
-  if (!IsSupported()) {
-    RTC_LOG(LS_ERROR) << "WMF H.265 encoder is not supported on this system.";
+std::unique_ptr<WmfVideoEncoder> WmfVideoEncoder::Create(
+    VideoCodecType codec_type,
+    const SdpVideoFormat& format) {
+  if (!IsSupported(codec_type)) {
+    RTC_LOG(LS_ERROR) << "WMF " << CodecTypeToPayloadString(codec_type)
+                      << " encoder is not supported on this system.";
     return nullptr;
   }
-  return std::make_unique<WmfH265Encoder>(codec);
+  return std::make_unique<WmfVideoEncoder>(codec_type, format);
 }
 
-bool WmfH265Encoder::IsSupported() {
+bool WmfVideoEncoder::IsSupported(VideoCodecType codec_type) {
   // Ensure COM is initialized on this thread (MF requires it)
   HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   bool should_uninit_com = SUCCEEDED(com_hr);
 
-  // Check if we can activate a HEVC encoder MFT
   HRESULT hr = MFStartup(MF_VERSION);
   if (FAILED(hr)) {
     if (should_uninit_com) CoUninitialize();
     return false;
   }
 
-  // Enumerate HEVC encoders
   MFT_REGISTER_TYPE_INFO output_type = {MFMediaType_Video,
-                                        MFVideoFormat_HEVC};
+                                        SubtypeOf(codec_type)};
   IMFActivate** activate = nullptr;
   UINT32 count = 0;
 
-  hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                 MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
-                     MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                 nullptr, &output_type, &activate, &count);
+  hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, EnumFlagsOf(codec_type), nullptr,
+                 &output_type, &activate, &count);
 
   bool supported = SUCCEEDED(hr) && count > 0;
 
-  // Clean up
   if (activate) {
     for (UINT32 i = 0; i < count; i++) {
       activate[i]->Release();
@@ -101,7 +185,7 @@ bool WmfH265Encoder::IsSupported() {
   return supported;
 }
 
-HRESULT WmfH265Encoder::InitMediaFoundation() {
+HRESULT WmfVideoEncoder::InitMediaFoundation() {
   // Ensure COM is initialized on the calling thread
   HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   if (SUCCEEDED(com_hr)) {
@@ -124,21 +208,19 @@ HRESULT WmfH265Encoder::InitMediaFoundation() {
   return S_OK;
 }
 
-HRESULT WmfH265Encoder::CreateHEVCEncoder() {
-  // Enumerate and activate HEVC encoders (prefer hardware)
+HRESULT WmfVideoEncoder::CreateEncoderMft() {
+  // Enumerate and activate encoders (hardware first)
   MFT_REGISTER_TYPE_INFO output_type = {MFMediaType_Video,
-                                        MFVideoFormat_HEVC};
+                                        SubtypeOf(codec_type_)};
   IMFActivate** activate = nullptr;
   UINT32 count = 0;
 
-  HRESULT hr = MFTEnumEx(
-      MFT_CATEGORY_VIDEO_ENCODER,
-      MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
-          MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-      nullptr, &output_type, &activate, &count);
+  HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, EnumFlagsOf(codec_type_),
+                         nullptr, &output_type, &activate, &count);
 
   if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_ERROR) << "No HEVC encoder MFT found. hr=" << static_cast<int>(hr);
+    RTC_LOG(LS_ERROR) << "No " << CodecName()
+                      << " encoder MFT found. hr=" << HrStr(hr);
     if (activate) CoTaskMemFree(activate);
     return E_FAIL;
   }
@@ -150,7 +232,7 @@ HRESULT WmfH265Encoder::CreateHEVCEncoder() {
     activate[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
                                     &friendly_name, &name_len);
     if (friendly_name) {
-      RTC_LOG(LS_INFO) << "Found HEVC encoder: "
+      RTC_LOG(LS_INFO) << "Found " << CodecName() << " encoder: "
                        << webrtc::ToUtf8(friendly_name, name_len);
       CoTaskMemFree(friendly_name);
     }
@@ -165,7 +247,8 @@ HRESULT WmfH265Encoder::CreateHEVCEncoder() {
   CoTaskMemFree(activate);
 
   if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "Failed to activate HEVC encoder MFT: " << HrStr(hr);
+    RTC_LOG(LS_ERROR) << "Failed to activate " << CodecName()
+                      << " encoder MFT: " << HrStr(hr);
     return hr;
   }
 
@@ -182,8 +265,8 @@ HRESULT WmfH265Encoder::CreateHEVCEncoder() {
     if (is_async) {
       hr = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
       if (FAILED(hr)) {
-        RTC_LOG(LS_ERROR) << "Failed to unlock async HEVC encoder MFT: "
-                          << HrStr(hr);
+        RTC_LOG(LS_ERROR) << "Failed to unlock async " << CodecName()
+                          << " encoder MFT: " << HrStr(hr);
         return hr;
       }
       is_async_ = true;
@@ -192,11 +275,17 @@ HRESULT WmfH265Encoder::CreateHEVCEncoder() {
     attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
   }
 
+  if (IsH264() && !is_async_) {
+    // Only hardware MFTs were enumerated, and those are asynchronous.
+    RTC_LOG(LS_ERROR) << "H.264 encoder MFT is not a hardware transform.";
+    return E_FAIL;
+  }
+
   if (is_async_) {
     hr = encoder_.As(&event_generator_);
     if (FAILED(hr)) {
-      RTC_LOG(LS_ERROR) << "Async HEVC MFT has no event generator: "
-                        << HrStr(hr);
+      RTC_LOG(LS_ERROR) << "Async " << CodecName()
+                        << " MFT has no event generator: " << HrStr(hr);
       return hr;
     }
     // Tell the hardware MFT that no DXGI device manager will be supplied, so
@@ -204,12 +293,29 @@ HRESULT WmfH265Encoder::CreateHEVCEncoder() {
     encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
   }
 
-  RTC_LOG(LS_INFO) << "HEVC encoder MFT activated successfully ("
+  if (IsH264()) {
+    // WebRTC sends frames in capture order: no B-frames. Most encoders only
+    // take this before the media types are set.
+    Microsoft::WRL::ComPtr<ICodecAPI> codec_api;
+    if (SUCCEEDED(encoder_.As(&codec_api))) {
+      VARIANT var;
+      VariantInit(&var);
+      var.vt = VT_UI4;
+      var.ulVal = 0;
+      codec_api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &var);
+      VariantInit(&var);
+      var.vt = VT_BOOL;
+      var.boolVal = VARIANT_TRUE;
+      codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &var);
+    }
+  }
+
+  RTC_LOG(LS_INFO) << CodecName() << " encoder MFT activated successfully ("
                    << (is_async_ ? "async/hardware" : "sync") << ").";
   return S_OK;
 }
 
-HRESULT WmfH265Encoder::ConfigureRateControl() {
+HRESULT WmfVideoEncoder::ConfigureRateControl() {
   Microsoft::WRL::ComPtr<ICodecAPI> codec_api;
   HRESULT hr = encoder_.As(&codec_api);
   if (FAILED(hr)) {
@@ -231,35 +337,47 @@ HRESULT WmfH265Encoder::ConfigureRateControl() {
   return S_OK;
 }
 
-HRESULT WmfH265Encoder::ConfigureOutputType() {
+HRESULT WmfVideoEncoder::SetOutputTypeWithProfile(UINT32 profile) {
   HRESULT hr = MFCreateMediaType(&output_type_);
   if (FAILED(hr)) return hr;
 
   output_type_->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  output_type_->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_HEVC);
+  output_type_->SetGUID(MF_MT_SUBTYPE, SubtypeOf(codec_type_));
   MFSetAttributeSize(output_type_.Get(), MF_MT_FRAME_SIZE, width_, height_);
   MFSetAttributeRatio(output_type_.Get(), MF_MT_FRAME_RATE, frame_rate_, 1);
   output_type_->SetUINT32(MF_MT_AVG_BITRATE, target_bitrate_bps_);
   output_type_->SetUINT32(MF_MT_INTERLACE_MODE,
                           MFVideoInterlace_Progressive);
   MFSetAttributeRatio(output_type_.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-  // Set HEVC profile to Main
-  output_type_->SetUINT32(MF_MT_MPEG2_PROFILE, 1);  // Main profile
-  output_type_->SetUINT32(MF_MT_MPEG2_LEVEL, 120);   // Level 4.0
-
-  RTC_LOG(LS_INFO) << "SetOutputType output_type_: " << output_type_.Get();
-
-  hr = encoder_->SetOutputType(output_stream_id_, output_type_.Get(), 0);
-  if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "SetOutputType failed: " << HrStr(hr);
-    return hr;
+  output_type_->SetUINT32(MF_MT_MPEG2_PROFILE, profile);
+  if (!IsH264()) {
+    // H.265 Main, level 4.0. H.264 leaves the level to the encoder, which
+    // picks it from the frame size and rate.
+    output_type_->SetUINT32(MF_MT_MPEG2_LEVEL, 120);
   }
 
-  return S_OK;
+  return encoder_->SetOutputType(output_stream_id_, output_type_.Get(), 0);
 }
 
-HRESULT WmfH265Encoder::ConfigureInputType() {
+HRESULT WmfVideoEncoder::ConfigureOutputType() {
+  std::vector<UINT32> profiles =
+      IsH264() ? H264ProfilesFor(format_) : std::vector<UINT32>{1};
+  HRESULT hr = E_FAIL;
+  for (UINT32 profile : profiles) {
+    hr = SetOutputTypeWithProfile(profile);
+    if (SUCCEEDED(hr)) {
+      RTC_LOG(LS_INFO) << CodecName() << " output type set, profile "
+                       << profile;
+      return S_OK;
+    }
+    RTC_LOG(LS_WARNING) << "SetOutputType with profile " << profile
+                        << " failed: " << HrStr(hr);
+  }
+  RTC_LOG(LS_ERROR) << "SetOutputType failed: " << HrStr(hr);
+  return hr;
+}
+
+HRESULT WmfVideoEncoder::ConfigureInputType() {
   HRESULT hr = MFCreateMediaType(&input_type_);
   if (FAILED(hr)) return hr;
 
@@ -280,7 +398,7 @@ HRESULT WmfH265Encoder::ConfigureInputType() {
   return S_OK;
 }
 
-int WmfH265Encoder::InitEncode(const VideoCodec* codec_settings,
+int WmfVideoEncoder::InitEncode(const VideoCodec* codec_settings,
                                 const Settings& settings) {
   if (!codec_settings) {
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
@@ -301,7 +419,7 @@ int WmfH265Encoder::InitEncode(const VideoCodec* codec_settings,
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  hr = CreateHEVCEncoder();
+  hr = CreateEncoderMft();
   if (FAILED(hr)) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -347,6 +465,7 @@ int WmfH265Encoder::InitEncode(const VideoCodec* codec_settings,
   pending_input_requests_ = 0;
   frame_timing_.clear();
   last_timing_ = FrameTiming();
+  parameter_sets_.clear();
 
   // Start processing
   hr = encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
@@ -358,14 +477,14 @@ int WmfH265Encoder::InitEncode(const VideoCodec* codec_settings,
   }
 
   initialized_ = true;
-  RTC_LOG(LS_INFO) << "WMF H.265 encoder initialized: " << width_ << "x"
-                   << height_ << " @ " << frame_rate_ << "fps, "
-                   << target_bitrate_bps_ / 1000 << " kbps";
+  RTC_LOG(LS_INFO) << "WMF " << CodecName() << " encoder initialized: "
+                   << width_ << "x" << height_ << " @ " << frame_rate_
+                   << "fps, " << target_bitrate_bps_ / 1000 << " kbps";
 
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-HRESULT WmfH265Encoder::ProcessInput(const VideoFrame& frame) {
+HRESULT WmfVideoEncoder::ProcessInput(const VideoFrame& frame) {
   webrtc::scoped_refptr<I420BufferInterface> i420_buffer =
       frame.video_frame_buffer()->ToI420();
 
@@ -428,28 +547,32 @@ HRESULT WmfH265Encoder::ProcessInput(const VideoFrame& frame) {
   return S_OK;
 }
 
-int32_t WmfH265Encoder::NextNaluPosition(uint8_t* buffer,
-                                          size_t buffer_size,
-                                          uint8_t* sc_length) {
-  if (buffer_size < 3) return -1;
-
-  *sc_length = 0;
-  for (size_t i = 0; i < buffer_size - 3; i++) {
-    if (buffer[i] == 0 && buffer[i + 1] == 0) {
-      if (buffer[i + 2] == 1) {
-        *sc_length = 3;
-        return static_cast<int32_t>(i);
-      }
-      if (i < buffer_size - 4 && buffer[i + 2] == 0 && buffer[i + 3] == 1) {
-        *sc_length = 4;
-        return static_cast<int32_t>(i);
-      }
+std::vector<uint8_t> WmfVideoEncoder::WithParameterSets(const uint8_t* data,
+                                                        size_t size,
+                                                        bool* is_keyframe) {
+  *is_keyframe = false;
+  std::vector<uint8_t> sets;
+  for (const Nalu& n : SplitNalus(data, size)) {
+    uint8_t type = NaluType(codec_type_, data[n.header]);
+    if (IsKeyframeSlice(codec_type_, type)) *is_keyframe = true;
+    if (IsParameterSet(codec_type_, type)) {
+      sets.insert(sets.end(), data + n.start, data + n.end);
     }
   }
-  return -1;
+  if (!sets.empty()) {
+    parameter_sets_ = std::move(sets);
+    return std::vector<uint8_t>(data, data + size);
+  }
+  std::vector<uint8_t> out;
+  if (*is_keyframe) {
+    out.reserve(parameter_sets_.size() + size);
+    out.insert(out.end(), parameter_sets_.begin(), parameter_sets_.end());
+  }
+  out.insert(out.end(), data, data + size);
+  return out;
 }
 
-HRESULT WmfH265Encoder::ProcessOutput() {
+HRESULT WmfVideoEncoder::ProcessOutput() {
   MFT_OUTPUT_DATA_BUFFER output_data = {};
   output_data.dwStreamID = output_stream_id_;
 
@@ -529,33 +652,13 @@ HRESULT WmfH265Encoder::ProcessOutput() {
   }
 
   if (data_length > 0 && callback_) {
-    // Determine frame type by scanning NALUs
     bool is_keyframe = false;
-    uint8_t sc_length = 0;
-    size_t offset = 0;
+    std::vector<uint8_t> frame =
+        WithParameterSets(data, data_length, &is_keyframe);
 
-    while (offset < data_length) {
-      int nalu_pos =
-          NextNaluPosition(data + offset, data_length - offset, &sc_length);
-      if (nalu_pos < 0) break;
-
-      size_t nalu_start = offset + nalu_pos + sc_length;
-      if (nalu_start < data_length) {
-        // H.265 NALU type is in bits 1-6 of the first byte
-        uint8_t nalu_type = (data[nalu_start] >> 1) & 0x3F;
-        // IRAP VCL NALUs only: BLA_W_LP(16) through RSV_IRAP_VCL23(23)
-        // VPS(32)/SPS(33)/PPS(34) are non-VCL and should NOT mark keyframe
-        if (nalu_type >= 16 && nalu_type <= 23) {
-          is_keyframe = true;
-        }
-      }
-      offset = nalu_start + 1;
-    }
-
-    // Create encoded image
     EncodedImage encoded_image;
     encoded_image.SetEncodedData(
-        EncodedImageBuffer::Create(data, data_length));
+        EncodedImageBuffer::Create(frame.data(), frame.size()));
     encoded_image._encodedWidth = width_;
     encoded_image._encodedHeight = height_;
     // Preserve the RTP timestamp from the upstream WebRTC frame
@@ -569,15 +672,29 @@ HRESULT WmfH265Encoder::ProcessOutput() {
     encoded_image.SetSpatialIndex(0);
 
     // Parse bitstream for QP
-    bitstream_parser_.ParseBitstream(
-        std::span<const uint8_t>(data, data_length));
-    
-    std::optional<int> qp = bitstream_parser_.GetLastSliceQp();
+    std::span<const uint8_t> bitstream(frame.data(), frame.size());
+    std::optional<int> qp;
+    if (IsH264()) {
+      h264_parser_.ParseBitstream(bitstream);
+      qp = h264_parser_.GetLastSliceQp();
+    } else {
+      h265_parser_.ParseBitstream(bitstream);
+      qp = h265_parser_.GetLastSliceQp();
+    }
     if (qp.has_value()) {
       encoded_image.qp_ = *qp;
-    } 
+    }
+
     CodecSpecificInfo codec_info;
-    codec_info.codecType = kVideoCodecH265;
+    codec_info.codecType = codec_type_;
+    if (IsH264()) {
+      // The factory only hands out this encoder for packetization-mode=1.
+      codec_info.codecSpecific.H264.packetization_mode =
+          H264PacketizationMode::NonInterleaved;
+      codec_info.codecSpecific.H264.temporal_idx = kNoTemporalIdx;
+      codec_info.codecSpecific.H264.base_layer_sync = false;
+      codec_info.codecSpecific.H264.idr_frame = is_keyframe;
+    }
 
     callback_->OnEncodedImage(encoded_image, &codec_info);
   }
@@ -594,7 +711,7 @@ HRESULT WmfH265Encoder::ProcessOutput() {
   return S_OK;
 }
 
-HRESULT WmfH265Encoder::PumpEvent(bool wait) {
+HRESULT WmfVideoEncoder::PumpEvent(bool wait) {
   Microsoft::WRL::ComPtr<IMFMediaEvent> event;
   HRESULT hr =
       event_generator_->GetEvent(wait ? 0 : MF_EVENT_FLAG_NO_WAIT, &event);
@@ -615,7 +732,8 @@ HRESULT WmfH265Encoder::PumpEvent(bool wait) {
     case MEError: {
       HRESULT status = S_OK;
       event->GetStatus(&status);
-      RTC_LOG(LS_ERROR) << "HEVC MFT reported MEError: " << HrStr(status);
+      RTC_LOG(LS_ERROR) << CodecName()
+                        << " MFT reported MEError: " << HrStr(status);
       return FAILED(status) ? status : E_FAIL;
     }
     default:
@@ -624,19 +742,20 @@ HRESULT WmfH265Encoder::PumpEvent(bool wait) {
   }
 }
 
-HRESULT WmfH265Encoder::EncodeAsync(const VideoFrame& frame) {
+HRESULT WmfVideoEncoder::EncodeAsync(const VideoFrame& frame) {
   int serviced = 0;
 
   // Wait for the MFT to ask for input, servicing output it produces meanwhile.
   while (pending_input_requests_ == 0) {
     if (++serviced > kMaxEventsPerEncode) {
-      RTC_LOG(LS_ERROR) << "HEVC MFT never requested input; dropping frame.";
+      RTC_LOG(LS_ERROR) << CodecName()
+                        << " MFT never requested input; dropping frame.";
       return MF_E_NOTACCEPTING;
     }
     HRESULT hr = PumpEvent(/*wait=*/true);
     if (FAILED(hr)) {
-      RTC_LOG(LS_ERROR) << "Waiting for HEVC MFT input request failed: "
-                        << HrStr(hr);
+      RTC_LOG(LS_ERROR) << "Waiting for " << CodecName()
+                        << " MFT input request failed: " << HrStr(hr);
       return hr;
     }
   }
@@ -654,7 +773,7 @@ HRESULT WmfH265Encoder::EncodeAsync(const VideoFrame& frame) {
   return S_OK;
 }
 
-int WmfH265Encoder::Encode(const VideoFrame& input_image,
+int WmfVideoEncoder::Encode(const VideoFrame& input_image,
                             const std::vector<VideoFrameType>* frame_types) {
   if (!initialized_ || !callback_) {
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
@@ -687,8 +806,12 @@ int WmfH265Encoder::Encode(const VideoFrame& input_image,
   if (is_async_) {
     HRESULT async_hr = EncodeAsync(input_image);
     if (FAILED(async_hr)) {
-      RTC_LOG(LS_ERROR) << "Async HEVC encode failed: " << HrStr(async_hr);
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      RTC_LOG(LS_ERROR) << "Async " << CodecName()
+                        << " encode failed: " << HrStr(async_hr);
+      // H.264 has OpenH264 behind it (the factory's fallback wrapper); H.265
+      // has nothing to fall back to.
+      return IsH264() ? WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE
+                      : WEBRTC_VIDEO_CODEC_ERROR;
     }
     return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -722,13 +845,13 @@ int WmfH265Encoder::Encode(const VideoFrame& input_image,
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-int WmfH265Encoder::RegisterEncodeCompleteCallback(
+int WmfVideoEncoder::RegisterEncodeCompleteCallback(
     EncodedImageCallback* callback) {
   callback_ = callback;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void WmfH265Encoder::SetRates(const RateControlParameters& parameters) {
+void WmfVideoEncoder::SetRates(const RateControlParameters& parameters) {
   if (!initialized_ || !encoder_) return;
 
   target_bitrate_bps_ = parameters.bitrate.get_sum_bps();
@@ -747,9 +870,9 @@ void WmfH265Encoder::SetRates(const RateControlParameters& parameters) {
   }
 }
 
-VideoEncoder::EncoderInfo WmfH265Encoder::GetEncoderInfo() const {
+VideoEncoder::EncoderInfo WmfVideoEncoder::GetEncoderInfo() const {
   EncoderInfo info;
-  info.implementation_name = "WMF_H265";
+  info.implementation_name = IsH264() ? "WMF_H264" : "WMF_H265";
   info.is_hardware_accelerated = true;
   info.supports_native_handle = false;
   info.supports_simulcast = false;
@@ -757,7 +880,7 @@ VideoEncoder::EncoderInfo WmfH265Encoder::GetEncoderInfo() const {
   return info;
 }
 
-int WmfH265Encoder::Release() {
+int WmfVideoEncoder::Release() {
   if (encoder_) {
     // Flush before ending the stream so no trailing output is handed to a
     // callback that may already be gone.
@@ -775,6 +898,7 @@ int WmfH265Encoder::Release() {
   pending_input_requests_ = 0;
   frame_timing_.clear();
   last_timing_ = FrameTiming();
+  parameter_sets_.clear();
 
   if (mf_started_) {
     MFShutdown();

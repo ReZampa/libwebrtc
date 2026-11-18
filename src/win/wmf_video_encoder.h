@@ -1,8 +1,8 @@
 // Copyright 2024 libwebrtc project authors. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef LIB_WEBRTC_WIN_WMF_H265_ENCODER_H_
-#define LIB_WEBRTC_WIN_WMF_H265_ENCODER_H_
+#ifndef LIB_WEBRTC_WIN_WMF_VIDEO_ENCODER_H_
+#define LIB_WEBRTC_WIN_WMF_VIDEO_ENCODER_H_
 
 #include <d3d11.h>
 #include <mfapi.h>
@@ -16,21 +16,32 @@
 #include <string>
 #include <vector>
 
+#include "api/video/video_codec_type.h"
 #include "api/video/video_frame.h"
+#include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_encoder.h"
+#include "common_video/h264/h264_bitstream_parser.h"
 #include "common_video/h265/h265_bitstream_parser.h"
 #include "rtc_base/synchronization/mutex.h"
 
 namespace webrtc {
 
-class WmfH265Encoder : public VideoEncoder {
+// H.264 or H.265 encoder on a Windows Media Foundation transform (the GPU's
+// encoder: NVENC, AMF or Quick Sync).
+//
+// H.265 takes the best MFT available, software included (WebRTC has no other
+// H.265 encoder). H.264 takes hardware MFTs only: without one, OpenH264 is the
+// better software encoder, and the factory falls back to it.
+class WmfVideoEncoder : public VideoEncoder {
  public:
-  explicit WmfH265Encoder(const VideoCodec& codec);
-  ~WmfH265Encoder() override;
+  WmfVideoEncoder(VideoCodecType codec_type, const SdpVideoFormat& format);
+  ~WmfVideoEncoder() override;
 
-  static std::unique_ptr<WmfH265Encoder> Create(const VideoCodec& codec);
-  static bool IsSupported();
+  // `codec_type` is kVideoCodecH264 or kVideoCodecH265.
+  static std::unique_ptr<WmfVideoEncoder> Create(VideoCodecType codec_type,
+                                                 const SdpVideoFormat& format);
+  static bool IsSupported(VideoCodecType codec_type);
 
   int InitEncode(const VideoCodec* codec_settings,
                  const Settings& settings) override;
@@ -42,20 +53,27 @@ class WmfH265Encoder : public VideoEncoder {
   int Release() override;
 
  private:
+  bool IsH264() const { return codec_type_ == kVideoCodecH264; }
+  const char* CodecName() const { return IsH264() ? "H.264" : "H.265"; }
+
   HRESULT InitMediaFoundation();
-  HRESULT CreateHEVCEncoder();
+  HRESULT CreateEncoderMft();
   HRESULT ConfigureInputType();
   HRESULT ConfigureOutputType();
+  HRESULT SetOutputTypeWithProfile(UINT32 profile);
   HRESULT ConfigureRateControl();
   HRESULT ProcessInput(const VideoFrame& frame);
   HRESULT ProcessOutput();
-  // Async (hardware) MFT helpers. Hardware HEVC encoders are asynchronous
-  // MFTs: they must be unlocked and driven through their event queue instead
-  // of the plain ProcessInput()/ProcessOutput() polling loop.
+  // Async (hardware) MFT helpers. Hardware encoders are asynchronous MFTs:
+  // they must be unlocked and driven through their event queue instead of the
+  // plain ProcessInput()/ProcessOutput() polling loop.
   HRESULT PumpEvent(bool wait);
   HRESULT EncodeAsync(const VideoFrame& frame);
-  int32_t NextNaluPosition(uint8_t* buffer, size_t buffer_size,
-                           uint8_t* sc_length);
+  // Builds the frame to send: when a keyframe comes without its parameter
+  // sets (SPS/PPS, plus VPS in H.265), the last ones seen go in front, so a
+  // viewer who joins on a requested keyframe can still decode it.
+  std::vector<uint8_t> WithParameterSets(const uint8_t* data, size_t size,
+                                         bool* is_keyframe);
 
   // Timing metadata for a frame handed to the MFT, keyed by the sample time
   // so that output samples can be matched back to their input frame.
@@ -65,6 +83,8 @@ class WmfH265Encoder : public VideoEncoder {
     uint32_t rtp_timestamp = 0;
   };
 
+  const VideoCodecType codec_type_;
+  const SdpVideoFormat format_;
   EncodedImageCallback* callback_ = nullptr;
   VideoCodec codec_settings_;
   int32_t width_ = 0;
@@ -92,9 +112,12 @@ class WmfH265Encoder : public VideoEncoder {
   DWORD output_stream_id_ = 0;
 
   std::vector<uint8_t> nv12_buffer_;
-  H265BitstreamParser bitstream_parser_;
+  // Last parameter-set NAL units (start codes included), in stream order.
+  std::vector<uint8_t> parameter_sets_;
+  H264BitstreamParser h264_parser_;
+  H265BitstreamParser h265_parser_;
 };
 
 }  // namespace webrtc
 
-#endif  // LIB_WEBRTC_WIN_WMF_H265_ENCODER_H_
+#endif  // LIB_WEBRTC_WIN_WMF_VIDEO_ENCODER_H_
