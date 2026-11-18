@@ -22,6 +22,7 @@
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv.h"
 #ifdef WEBRTC_WIN
 #include "modules/desktop_capture/win/window_capture_utils.h"
@@ -347,11 +348,8 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     return capture_state_;
   }
 
-  if (fps >= 60) {
-    capture_delay_ = uint32_t(1000.0 / 60.0);
-  } else {
-    capture_delay_ = uint32_t(1000.0 / fps);
-  }
+  capture_period_us_ = 1000000 / std::min<uint32_t>(fps, 60);
+  next_capture_us_ = 0;
 
   if (source_id_ != -1) {
     // WGC creates its capture item when the source is selected: do it on
@@ -456,15 +454,13 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
   {
     width = w_ > 0 ? w_ : width;
     height = h_ > 0 ? h_ : height;
-    if (!i420_buffer_ || !i420_buffer_.get() ||
-        i420_buffer_->width() * i420_buffer_->height() != width * height) {
-      i420_buffer_ = webrtc::I420Buffer::Create(width, height);
-    }
+    webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+        NextBuffer(width, height);
 
-    libyuv::ConvertToI420(frame->data(), 0, i420_buffer_->MutableDataY(),
-                          i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
-                          i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
-                          i420_buffer_->StrideV(), x_, y_,
+    libyuv::ConvertToI420(frame->data(), 0, buffer->MutableDataY(),
+                          buffer->StrideY(), buffer->MutableDataU(),
+                          buffer->StrideU(), buffer->MutableDataV(),
+                          buffer->StrideV(), x_, y_,
 #ifdef WEBRTC_WIN
                           rect_.width(), rect_.height(),
 #else
@@ -472,7 +468,7 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 #endif
                           width, height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
 
-    OnFrame(webrtc::VideoFrame(i420_buffer_, 0, webrtc::TimeMillis(),
+    OnFrame(webrtc::VideoFrame(buffer, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
   }
 #ifdef WEBRTC_WIN
@@ -496,27 +492,43 @@ void RTCDesktopCapturerImpl::OnWgcFrame(const webrtc::DesktopFrame& frame) {
   if (width <= 0 || height <= 0) {
     return;
   }
-  if (!i420_buffer_ || i420_buffer_->width() != width ||
-      i420_buffer_->height() != height) {
-    i420_buffer_ = webrtc::I420Buffer::Create(width, height);
-  }
+  webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+      NextBuffer(width, height);
   const uint8_t* src = frame.data() + y * frame.stride() +
                        x * webrtc::DesktopFrame::kBytesPerPixel;
-  libyuv::ARGBToI420(src, frame.stride(), i420_buffer_->MutableDataY(),
-                     i420_buffer_->StrideY(), i420_buffer_->MutableDataU(),
-                     i420_buffer_->StrideU(), i420_buffer_->MutableDataV(),
-                     i420_buffer_->StrideV(), width, height);
-  OnFrame(webrtc::VideoFrame(i420_buffer_, 0, webrtc::TimeMillis(),
+  libyuv::ARGBToI420(src, frame.stride(), buffer->MutableDataY(),
+                     buffer->StrideY(), buffer->MutableDataU(),
+                     buffer->StrideU(), buffer->MutableDataV(),
+                     buffer->StrideV(), width, height);
+  OnFrame(webrtc::VideoFrame(buffer, 0, webrtc::TimeMillis(),
                              webrtc::kVideoRotation_0));
+}
+
+webrtc::scoped_refptr<webrtc::I420Buffer> RTCDesktopCapturerImpl::NextBuffer(
+    int width, int height) {
+  webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+      buffer_pool_.CreateI420Buffer(width, height);
+  // Every pooled buffer still in use downstream: one more, outside the pool.
+  return buffer ? buffer : webrtc::I420Buffer::Create(width, height);
 }
 
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
   if (capture_state_ == CS_RUNNING) {
+    // Resenha: captures on a fixed schedule. Waiting a whole period after
+    // each capture added the capture time to it (60 fps came out as 42-48).
+    const int64_t now_us = webrtc::TimeMicros();
+    if (next_capture_us_ == 0 || now_us - next_capture_us_ > capture_period_us_) {
+      // First capture, or one that ran late: restart the schedule from now
+      // instead of rushing to catch up.
+      next_capture_us_ = now_us;
+    }
+    next_capture_us_ += capture_period_us_;
     capturer_->CaptureFrame();
+    const int64_t wait_us =
+        std::max<int64_t>(0, next_capture_us_ - webrtc::TimeMicros());
     thread_->PostDelayedHighPrecisionTask(
-        [this]() { CaptureFrame(); },
-        webrtc::TimeDelta::Millis(capture_delay_));
+        [this]() { CaptureFrame(); }, webrtc::TimeDelta::Micros(wait_us));
   }
 }
 

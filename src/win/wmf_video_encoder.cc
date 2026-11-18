@@ -459,9 +459,6 @@ int WmfVideoEncoder::InitEncode(const VideoCodec* codec_settings,
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  // Pre-allocate NV12 conversion buffer
-  nv12_buffer_.resize(width_ * height_ * 3 / 2);
-
   pending_input_requests_ = 0;
   frame_timing_.clear();
   last_timing_ = FrameTiming();
@@ -488,20 +485,8 @@ HRESULT WmfVideoEncoder::ProcessInput(const VideoFrame& frame) {
   webrtc::scoped_refptr<I420BufferInterface> i420_buffer =
       frame.video_frame_buffer()->ToI420();
 
-  int y_stride = i420_buffer->StrideY();
-  int u_stride = i420_buffer->StrideU();
-  int v_stride = i420_buffer->StrideV();
+  const int nv12_size = width_ * height_ * 3 / 2;
 
-  // Create NV12 buffer
-  int nv12_size = width_ * height_ * 3 / 2;
-
-  // Convert I420 to NV12 using pre-allocated buffer
-  libyuv::I420ToNV12(
-      i420_buffer->DataY(), y_stride, i420_buffer->DataU(), u_stride,
-      i420_buffer->DataV(), v_stride, nv12_buffer_.data(), width_,
-      nv12_buffer_.data() + width_ * height_, width_, width_, height_);
-
-  // Create MF sample
   Microsoft::WRL::ComPtr<IMFSample> sample;
   HRESULT hr = MFCreateSample(&sample);
   if (FAILED(hr)) return hr;
@@ -514,7 +499,12 @@ HRESULT WmfVideoEncoder::ProcessInput(const VideoFrame& frame) {
   hr = buffer->Lock(&buffer_data, nullptr, nullptr);
   if (FAILED(hr)) return hr;
 
-  memcpy(buffer_data, nv12_buffer_.data(), nv12_size);
+  // Converts straight into the MFT's buffer (no intermediate copy).
+  libyuv::I420ToNV12(i420_buffer->DataY(), i420_buffer->StrideY(),
+                     i420_buffer->DataU(), i420_buffer->StrideU(),
+                     i420_buffer->DataV(), i420_buffer->StrideV(),
+                     buffer_data, width_, buffer_data + width_ * height_,
+                     width_, width_, height_);
 
   hr = buffer->Unlock();
   if (FAILED(hr)) return hr;

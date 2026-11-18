@@ -19,6 +19,7 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
+#include "common_video/include/video_frame_buffer_pool.h"
 #include "include/rtc_desktop_capturer.h"
 #include "include/rtc_desktop_device.h"
 #include "include/rtc_types.h"
@@ -78,15 +79,22 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   void CaptureFrame();
   // Converts a frame from the Windows.Graphics.Capture capturer.
   void OnWgcFrame(const webrtc::DesktopFrame& frame);
+  // Resenha: a buffer the encoder is not reading. Reusing one buffer let a
+  // new capture overwrite a frame still being encoded.
+  webrtc::scoped_refptr<webrtc::I420Buffer> NextBuffer(int width, int height);
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
   std::unique_ptr<webrtc::Thread> thread_;
-  webrtc::scoped_refptr<webrtc::I420Buffer> i420_buffer_;
+  webrtc::VideoFrameBufferPool buffer_pool_{/*zero_initialize=*/false,
+                                            /*max_number_of_buffers=*/8};
   CaptureState capture_state_ = CS_STOPPED;
   DesktopType type_;
   webrtc::DesktopCapturer::SourceId source_id_;
   DesktopCapturerObserver* observer_ = nullptr;
-  uint32_t capture_delay_ = 1000;  // 1s
+  // Resenha: time between captures, and when the next one is due. The wait
+  // discounts the time a capture takes, so 60 fps means 60 fps.
+  int64_t capture_period_us_ = 1000000;  // 1s
+  int64_t next_capture_us_ = 0;
   webrtc::DesktopCapturer::Result result_ =
       webrtc::DesktopCapturer::Result::SUCCESS;
   webrtc::Thread* signaling_thread_ = nullptr;

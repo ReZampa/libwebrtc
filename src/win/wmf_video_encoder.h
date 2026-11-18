@@ -111,7 +111,6 @@ class WmfVideoEncoder : public VideoEncoder {
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 
-  std::vector<uint8_t> nv12_buffer_;
   // Last parameter-set NAL units (start codes included), in stream order.
   std::vector<uint8_t> parameter_sets_;
   H264BitstreamParser h264_parser_;
