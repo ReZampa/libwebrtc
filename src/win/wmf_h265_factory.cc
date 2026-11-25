@@ -4,11 +4,13 @@
 #include "src/win/wmf_h265_factory.h"
 
 #include "api/environment/environment.h"
+#include "api/video_codecs/video_decoder_software_fallback_wrapper.h"
 #include "api/video_codecs/video_encoder_software_fallback_wrapper.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "media/base/media_constants.h"
 #include "media/engine/simulcast_encoder_adapter.h"
 #include "rtc_base/logging.h"
+#include "src/win/wmf_h264_decoder.h"
 #include "src/win/wmf_h265_decoder.h"
 #include "src/win/wmf_video_encoder.h"
 
@@ -112,17 +114,23 @@ class WmfH265VideoEncoderFactory : public VideoEncoderFactory {
 
 // ------- Decoder factory -------
 
+// H.265 comes from the WMF decoder alone. H.264 comes from the GPU's decoder
+// when there is one, with the builtin decoder (FFmpeg) behind it: if the GPU
+// fails to configure or gives up decoding, the wrapper switches to software.
 class WmfH265VideoDecoderFactory : public VideoDecoderFactory {
  public:
   explicit WmfH265VideoDecoderFactory(
       std::unique_ptr<VideoDecoderFactory> builtin)
       : builtin_(std::move(builtin)),
-        h265_supported_(WmfH265Decoder::IsSupported()) {
+        h265_supported_(WmfH265Decoder::IsSupported()),
+        h264_supported_(WmfH264Decoder::IsSupported()) {
     if (h265_supported_) {
       RTC_LOG(LS_INFO) << "WMF H.265 decoder is available.";
     } else {
       RTC_LOG(LS_WARNING) << "WMF H.265 decoder is NOT available.";
     }
+    RTC_LOG(LS_INFO) << "WMF H.264 decoder is "
+                     << (h264_supported_ ? "available." : "NOT available.");
   }
 
   std::unique_ptr<VideoDecoder> Create(const Environment& env,
@@ -136,6 +144,17 @@ class WmfH265VideoDecoderFactory : public VideoDecoderFactory {
       RTC_LOG(LS_WARNING)
           << "Failed to create WMF H.265 decoder, no fallback available.";
       return nullptr;
+    }
+    if (h264_supported_ &&
+        absl::EqualsIgnoreCase(format.name, kH264CodecName)) {
+      std::unique_ptr<VideoDecoder> software = builtin_->Create(env, format);
+      std::unique_ptr<VideoDecoder> hardware = WmfH264Decoder::Create();
+      if (software && hardware) {
+        return CreateVideoDecoderSoftwareFallbackWrapper(
+            env, std::move(software), std::move(hardware));
+      }
+      if (software) return software;
+      return hardware;
     }
     return builtin_->Create(env, format);
   }
@@ -157,12 +176,19 @@ class WmfH265VideoDecoderFactory : public VideoDecoderFactory {
         absl::EqualsIgnoreCase(format.name, kH265CodecName)) {
       return {.is_supported = true, .is_power_efficient = true};
     }
-    return builtin_->QueryCodecSupport(format, reference_scaling);
+    CodecSupport support =
+        builtin_->QueryCodecSupport(format, reference_scaling);
+    if (support.is_supported && h264_supported_ &&
+        absl::EqualsIgnoreCase(format.name, kH264CodecName)) {
+      support.is_power_efficient = true;
+    }
+    return support;
   }
 
  private:
   std::unique_ptr<VideoDecoderFactory> builtin_;
   bool h265_supported_;
+  bool h264_supported_;
 };
 
 }  // namespace

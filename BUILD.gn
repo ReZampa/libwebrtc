@@ -227,6 +227,8 @@ rtc_shared_library("libwebrtc") {
     sources += [
       "src/win/wmf_video_encoder.cc",
       "src/win/wmf_video_encoder.h",
+      "src/win/wmf_h264_decoder.cc",
+      "src/win/wmf_h264_decoder.h",
       "src/win/wmf_h265_decoder.cc",
       "src/win/wmf_h265_decoder.h",
       "src/win/wmf_h265_factory.cc",
