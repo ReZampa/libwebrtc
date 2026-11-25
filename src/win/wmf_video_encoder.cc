@@ -323,18 +323,40 @@ HRESULT WmfVideoEncoder::ConfigureRateControl() {
     return S_OK;  // Non-fatal: MFT will use its default
   }
 
-  // Set CBR mode — required for WebRTC real-time streaming
+  // Peak-constrained VBR with the peak at the target and a one second buffer:
+  // the encoder may spend less on easy frames but never goes over. Plain CBR
+  // overshot (10-13 Mbps for 8 Mbps on AMD). Must be set before the media
+  // types, or the MFT keeps its default mode.
   VARIANT var;
   VariantInit(&var);
   var.vt = VT_UI4;
-  var.ulVal = eAVEncCommonRateControlMode_CBR;
+  var.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
   hr = codec_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
   if (FAILED(hr)) {
-    RTC_LOG(LS_WARNING) << "Failed to set CBR rate control: "
-                        << static_cast<int>(hr);
+    RTC_LOG(LS_WARNING) << "Peak-constrained VBR not supported ("
+                        << static_cast<int>(hr) << "), using CBR.";
+    var.ulVal = eAVEncCommonRateControlMode_CBR;
+    hr = codec_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING) << "Failed to set CBR rate control: "
+                          << static_cast<int>(hr);
+    }
   }
+  if (target_bitrate_bps_ > 0) SetBitrateValues(codec_api.Get(), target_bitrate_bps_);
 
   return S_OK;
+}
+
+bool WmfVideoEncoder::SetBitrateValues(ICodecAPI* codec_api, uint32_t bps) {
+  VARIANT var;
+  VariantInit(&var);
+  var.vt = VT_UI4;
+  var.ulVal = bps;
+  const bool ok =
+      SUCCEEDED(codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var));
+  codec_api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &var);
+  codec_api->SetValue(&CODECAPI_AVEncCommonBufferSize, &var);  // 1 s, in bits
+  return ok;
 }
 
 HRESULT WmfVideoEncoder::SetOutputTypeWithProfile(UINT32 profile) {
@@ -442,6 +464,12 @@ int WmfVideoEncoder::InitEncode(const VideoCodec* codec_settings,
     }
   }
 
+  // Rate control mode only takes effect before the media types are set.
+  hr = ConfigureRateControl();
+  if (FAILED(hr)) {
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
   // Must set output type before input type for most MF encoders
   hr = ConfigureOutputType();
   if (FAILED(hr)) {
@@ -449,12 +477,6 @@ int WmfVideoEncoder::InitEncode(const VideoCodec* codec_settings,
   }
 
   hr = ConfigureInputType();
-  if (FAILED(hr)) {
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-
-  // Set rate control after media types are configured
-  hr = ConfigureRateControl();
   if (FAILED(hr)) {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -869,13 +891,7 @@ void WmfVideoEncoder::ApplyBitrate(bool force) {
   }
   Microsoft::WRL::ComPtr<ICodecAPI> codec_api;
   if (FAILED(encoder_.As(&codec_api))) return;
-  VARIANT var;
-  VariantInit(&var);
-  var.vt = VT_UI4;
-  var.ulVal = bps;
-  if (SUCCEEDED(codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var))) {
-    applied_bitrate_bps_ = bps;
-  }
+  if (SetBitrateValues(codec_api.Get(), bps)) applied_bitrate_bps_ = bps;
 }
 
 VideoEncoder::EncoderInfo WmfVideoEncoder::GetEncoderInfo() const {

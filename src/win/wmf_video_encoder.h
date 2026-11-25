@@ -9,6 +9,7 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <strmif.h>
 #include <wrl/client.h>
 
 #include <map>
@@ -56,6 +57,8 @@ class WmfVideoEncoder : public VideoEncoder {
  private:
   // Sends the adjusted target to the MFT when it moved enough to matter.
   void ApplyBitrate(bool force);
+  // Mean, peak and buffer (one second) all at bps.
+  bool SetBitrateValues(ICodecAPI* codec_api, uint32_t bps);
 
   bool IsH264() const { return codec_type_ == kVideoCodecH264; }
   const char* CodecName() const { return IsH264() ? "H.264" : "H.265"; }
