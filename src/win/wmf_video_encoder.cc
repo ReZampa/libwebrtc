@@ -864,6 +864,10 @@ VideoEncoder::EncoderInfo WmfVideoEncoder::GetEncoderInfo() const {
   EncoderInfo info;
   info.implementation_name = IsH264() ? "WMF_H264" : "WMF_H265";
   info.is_hardware_accelerated = true;
+  // The MFT runs its own CBR rate control. Without this flag WebRTC's frame
+  // dropper also kicks in and, at 1080p60, threw away every other frame
+  // (capture at 60 fps, 30 fps out, pinned at the target bitrate).
+  info.has_trusted_rate_controller = true;
   info.supports_native_handle = false;
   info.supports_simulcast = false;
   info.requested_resolution_alignment = 2;  // NV12 requires even dimensions
