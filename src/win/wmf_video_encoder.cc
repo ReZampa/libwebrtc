@@ -459,6 +459,10 @@ int WmfVideoEncoder::InitEncode(const VideoCodec* codec_settings,
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
+  bitrate_adjuster_.SetTargetBitrateBps(target_bitrate_bps_);
+  applied_bitrate_bps_ = 0;
+  ApplyBitrate(/*force=*/true);
+
   pending_input_requests_ = 0;
   frame_timing_.clear();
   last_timing_ = FrameTiming();
@@ -686,6 +690,8 @@ HRESULT WmfVideoEncoder::ProcessOutput() {
       codec_info.codecSpecific.H264.idr_frame = is_keyframe;
     }
 
+    bitrate_adjuster_.Update(encoded_image.size());
+    ApplyBitrate(/*force=*/false);
     callback_->OnEncodedImage(encoded_image, &codec_info);
   }
 
@@ -848,15 +854,27 @@ void WmfVideoEncoder::SetRates(const RateControlParameters& parameters) {
   frame_rate_ = static_cast<uint32_t>(parameters.framerate_fps);
   if (frame_rate_ == 0) frame_rate_ = 30;
 
-  // Update bitrate via CODECAPI
+  bitrate_adjuster_.SetTargetBitrateBps(target_bitrate_bps_);
+  ApplyBitrate(/*force=*/true);
+}
+
+void WmfVideoEncoder::ApplyBitrate(bool force) {
+  const uint32_t bps = bitrate_adjuster_.GetAdjustedBitrateBps();
+  if (bps == 0) return;
+  // Each change resets the MFT rate control a little; skip tiny corrections.
+  if (!force && applied_bitrate_bps_ != 0) {
+    const uint32_t diff = bps > applied_bitrate_bps_ ? bps - applied_bitrate_bps_
+                                                       : applied_bitrate_bps_ - bps;
+    if (diff * 20 < applied_bitrate_bps_) return;  // under 5%
+  }
   Microsoft::WRL::ComPtr<ICodecAPI> codec_api;
-  HRESULT hr = encoder_.As(&codec_api);
-  if (SUCCEEDED(hr)) {
-    VARIANT var;
-    VariantInit(&var);
-    var.vt = VT_UI4;
-    var.ulVal = target_bitrate_bps_;
-    codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
+  if (FAILED(encoder_.As(&codec_api))) return;
+  VARIANT var;
+  VariantInit(&var);
+  var.vt = VT_UI4;
+  var.ulVal = bps;
+  if (SUCCEEDED(codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var))) {
+    applied_bitrate_bps_ = bps;
   }
 }
 

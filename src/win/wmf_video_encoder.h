@@ -21,6 +21,7 @@
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_encoder.h"
+#include "common_video/include/bitrate_adjuster.h"
 #include "common_video/h264/h264_bitstream_parser.h"
 #include "common_video/h265/h265_bitstream_parser.h"
 #include "rtc_base/synchronization/mutex.h"
@@ -53,6 +54,9 @@ class WmfVideoEncoder : public VideoEncoder {
   int Release() override;
 
  private:
+  // Sends the adjusted target to the MFT when it moved enough to matter.
+  void ApplyBitrate(bool force);
+
   bool IsH264() const { return codec_type_ == kVideoCodecH264; }
   const char* CodecName() const { return IsH264() ? "H.264" : "H.265"; }
 
@@ -91,6 +95,11 @@ class WmfVideoEncoder : public VideoEncoder {
   int32_t height_ = 0;
   uint32_t target_bitrate_bps_ = 0;
   uint32_t max_bitrate_bps_ = 0;
+  // The hardware CBR overshoots (12-13 Mbps for an 8 Mbps target at 1080p60
+  // on AMD). WebRTC trusts this encoder's rate control, so the adjuster asks
+  // the MFT for less, from the bytes it really produces.
+  BitrateAdjuster bitrate_adjuster_{0.5f, 0.95f};
+  uint32_t applied_bitrate_bps_ = 0;
   uint32_t frame_rate_ = 30;
   bool initialized_ = false;
   bool mf_started_ = false;
