@@ -17,6 +17,8 @@ class RTCIceCandidateImpl : public RTCIceCandidate {
 
   virtual int sdp_mline_index() const override;
 
+  virtual const string username_fragment() const override;
+
   virtual bool ToString(string& out) override;
 
   webrtc::IceCandidateInterface* candidate() { return candidate_.get(); }

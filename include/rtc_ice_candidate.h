@@ -18,6 +18,10 @@ class RTCIceCandidate : public RefCountInterface {
 
   virtual int sdp_mline_index() const = 0;
 
+  // The ICE username fragment (ufrag) of the ICE generation the candidate
+  // belongs to. It changes with every ICE restart. Empty when unknown.
+  virtual const string username_fragment() const = 0;
+
   virtual bool ToString(string& out) = 0;
 
  protected:
